@@ -1,21 +1,34 @@
-use std::fs;
-
+use anyhow::Error;
 use axum::{
     Router,
-    extract::{WebSocketUpgrade, ws::WebSocket},
+    extract::{
+        State, WebSocketUpgrade,
+        ws::{Message, Utf8Bytes, WebSocket},
+    },
     response::{Form, Html, Response},
-    routing::get,
+    routing::{any, get},
 };
+use futures_util::SinkExt;
+use futures_util::stream::StreamExt;
 use serde::Deserialize;
+use std::{fs, os::linux::raw::stat};
+use tokio::{
+    select,
+    sync::broadcast::{self, Sender},
+};
 #[tokio::main]
 async fn main() {
+    let (tx, _) = broadcast::channel(16);
     let app = Router::new()
         .route("/test", axum::routing::get(test))
-        .route("/newuser", get(show_form).post(accept_form));
+        .route("/newuser", get(show_form).post(accept_form))
+        .route("/ws", any(handler))
+        .with_state(AppState { tx: tx.clone() });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
     axum::serve(listener, app).await.unwrap();
+    tx.send(String::from("hallo")).unwrap();
 }
 async fn show_form() -> Html<String> {
     match fs::read_to_string("assets/newuserform.html") {
@@ -69,9 +82,50 @@ async fn accept_form(Form(input): Form<Input>) -> Html<String> {
 async fn test() -> String {
     String::from("Hello World")
 }
-async fn handler(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(handle_socket)
+#[derive(Clone)]
+struct AppState {
+    tx: Sender<String>,
 }
-async fn handle_socket(mut socket: WebSocket) {
-    unimplemented!()
+async fn handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
+}
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let mut rx = state.tx.subscribe();
+    let (mut sender, mut receiver) = socket.split();
+    loop {
+        let mut awaitmsg = async || {
+            if let Some(Ok(msg)) = receiver.next().await {
+                if let Ok(text) = msg.to_text() {
+                    if let Err(e) = state.tx.send(text.to_string()) {
+                        println!("Cannot send message to broadcast channel {e}")
+                    }
+                }
+            } else {
+                println!("Client disconnected");
+                return Err(());
+            }
+            Ok(())
+        };
+        let mut bc = {
+            async || {
+                let bcmsg = rx.recv().await.unwrap();
+                match sender
+                    .send(Message::from(format!(
+                        "Message from another client {}",
+                        bcmsg
+                    )))
+                    .await
+                {
+                    Ok(_) => (),
+                    Err(e) => {
+                        println!("{e}");
+                    }
+                };
+            }
+        };
+        select! {
+            val1 =  awaitmsg() =>{ println!("Got message from client");}
+            val2= bc() =>{println!("got message from broadcast channel");}
+        };
+    }
 }
